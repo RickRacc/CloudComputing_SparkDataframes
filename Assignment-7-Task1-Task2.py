@@ -83,41 +83,55 @@ print("Word Postions in our Feature Matrix. Last 20 words in 20k positions: ", d
 
 
 
-dictionaryMap = {topWords[i][0]: i for i in range(len(topWords))}
+
+# Build dictionary from topWords from Task 1
+# Make sure Task 1 also uses:
+# topWords = allCounts.top(VOCAB_SIZE, key=lambda x: x[1])
+dictionaryMap = {word: i for i, (word, count) in enumerate(topWords)}
 dictionaryBC = sc.broadcast(dictionaryMap)
 
-
+# (docID, pos) for every word in every document that is in our vocabulary
 justDocAndPos = keyAndListOfWords.flatMap(
-    lambda x: [(x[0], dictionaryBC.value[w]) for w in x[1] if w in dictionaryBC.value]
+    lambda x: ((x[0], dictionaryBC.value[w]) for w in x[1] if w in dictionaryBC.value)
 )
 
-
+# Count occurrences of each vocabulary position inside each document
+# ((docID, pos), count)
 docPosCounts = justDocAndPos.map(
     lambda x: ((x[0], x[1]), 1)
 ).reduceByKey(
     lambda a, b: a + b
-)
+).persist()
 
+# Rearrange to (docID, (pos, count))
 docWordCounts = docPosCounts.map(
     lambda x: (x[0][0], (x[0][1], x[1]))
 )
 
-# Build normalized TF vectors
-def seqOp(arr, pc):
+# ---- MAIN PERFORMANCE FIX ----
+# Instead of aggregateByKey(np.zeros(VOCAB_SIZE), ...),
+# aggregate sparse dictionaries and normalize after.
+def seqOp(d, pc):
     pos, cnt = pc
-    arr[pos] = cnt
-    return arr
+    d[pos] = cnt
+    return d
 
+def combOp(d1, d2):
+    d1.update(d2)
+    return d1
 
-allDocsAsNumpyArrays = (
-    docWordCounts.aggregateByKey(np.zeros(VOCAB_SIZE), seqOp, add)
-    .mapValues(lambda arr: arr / arr.sum() if arr.sum() > 0 else arr)
+# (docID, {pos: raw_count, ...})
+docCountDicts = docWordCounts.aggregateByKey({}, seqOp, combOp)
+
+# Normalize to TF: (docID, {pos: tf, ...})
+docTfSparse = docCountDicts.mapValues(
+    lambda d: {pos: cnt / float(sum(d.values())) for pos, cnt in d.items()} if len(d) > 0 else d
 )
 
-# print(allDocsAsNumpyArrays.take(3))
+print(docTfSparse.take(3))
 
-# Compute document frequency directly from unique (docID, pos) pairs
-# Each ((docID, pos), count) means that word-position pos appears in that doc at least once
+# Compute DF directly from unique (docID, pos) pairs
+# (pos, document_frequency)
 dfCounts = docPosCounts.map(
     lambda x: (x[0][1], 1)
 ).reduceByKey(
@@ -128,17 +142,17 @@ dfArray = np.ones(VOCAB_SIZE)
 for pos, df in dfCounts:
     dfArray[pos] = df
 
-# Inverse document frequency
+# IDF(w) = log(numberOfDocs / df(w))
 idfArray = np.log(np.divide(np.full(VOCAB_SIZE, numberOfDocs), dfArray))
 
-# TF-IDF vectors for pages
-pageTfidfRDD = allDocsAsNumpyArrays.map(
-    lambda x: (x[0], np.multiply(x[1], idfArray))
+# Build sparse TF-IDF vectors: (docID, {pos: tfidf, ...})
+pageTfidfRDD = docTfSparse.mapValues(
+    lambda d: {pos: tf * idfArray[pos] for pos, tf in d.items()}
 ).persist()
 
 print("tfidf docs:", pageTfidfRDD.count())
 
-# Keep only category rows whose pageID is in our corpus
+# Keep only categories for pages that exist in our corpus
 corpusDocIDs = set(pageTfidfRDD.map(lambda x: x[0]).collect())
 corpusDocIDsBroadcast = sc.broadcast(corpusDocIDs)
 
@@ -148,46 +162,46 @@ wikiCatsFiltered = wikiCats.filter(
 
 print("wikiCatsFiltered count:", wikiCatsFiltered.count())
 
+# Precompute pageID -> list of categories once
+pageCatsMap = wikiCatsFiltered.groupByKey().mapValues(list).collectAsMap()
+pageCatsBC = sc.broadcast(pageCatsMap)
 
-# kNN prediction:
-# 1. compare query against page TF-IDF vectors
-# 2. take top-k pages
-# 3. vote using categories attached to those pages
+# kNN prediction using sparse query and sparse page vectors
 def getPrediction(textInput, k):
     words = regex.sub(' ', textInput).lower().split()
     positions = [dictionaryBC.value[w] for w in words if w in dictionaryBC.value]
 
-    myArray = np.zeros(VOCAB_SIZE)
-    if len(positions) > 0:
-        np.add.at(myArray, positions, 1)
-        mysum = np.sum(myArray)
-        if mysum > 0:
-            myArray = myArray / mysum
+    queryCounts = Counter(positions)
+    total = sum(queryCounts.values())
 
-    myArray = np.multiply(myArray, idfArray)
+    if total == 0:
+        return []
 
-    # similarity to each page
-    distances = pageTfidfRDD.map(lambda x: (x[0], np.dot(x[1], myArray)))
+    # Sparse query TF-IDF: {pos: tfidf_value}
+    querySparse = {
+        pos: (cnt / float(total)) * idfArray[pos]
+        for pos, cnt in queryCounts.items()
+    }
 
-    # top-k nearest pages
-    topKPages = distances.top(k, key=lambda x: x[1])
-
-    # get page ids of top-k pages
-    topKPageIDs = set([x[0] for x in topKPages])
-    topKPageIDsBroadcast = sc.broadcast(topKPageIDs)
-
-    # vote over categories attached to those pages
-    numTimes = (
-        wikiCatsFiltered
-        .filter(lambda x: x[0] in topKPageIDsBroadcast.value)
-        .map(lambda x: (x[1], 1))
-        .reduceByKey(lambda a, b: a + b)
+    # Score each page using only nonzero query positions
+    pageDistances = pageTfidfRDD.map(
+        lambda x: (
+            x[0],
+            sum(x[1].get(pos, 0.0) * qval for pos, qval in querySparse.items())
+        )
     )
 
-    return numTimes.top(k, key=lambda x: x[1])
+    topKPages = pageDistances.top(k, key=lambda x: x[1])
+
+    # Vote over categories of the top-k pages
+    categoryCounts = Counter()
+    for page_id, _score in topKPages:
+        for cat in pageCatsBC.value.get(page_id, []):
+            categoryCounts[cat] += 1
+
+    return categoryCounts.most_common(k)
 
 
 print(getPrediction('Sport Basketball Volleyball Soccer', 10))
 print(getPrediction('What is the capital city of Australia?', 10))
 print(getPrediction('How many goals Vancouver score last year?', 10))
-
