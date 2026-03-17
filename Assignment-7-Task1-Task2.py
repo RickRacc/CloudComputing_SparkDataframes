@@ -8,6 +8,9 @@ import numpy as np
 
 from numpy import dot
 from numpy.linalg import norm
+from operator import add
+
+VOCAB_SIZE = 5000
 
 # point Spark's JVM worker processes to the same python binary running this script
 # on windows, spark tries to run "python" which hits MS Store alias
@@ -42,10 +45,10 @@ regex = re.compile('[^a-zA-Z]')
 keyAndListOfWords = keyAndText.map(lambda x : (str(x[0]), regex.sub(' ', x[1]).lower().split()))
 
 
-# Builds a normalized term-frequency array of size 20000.
+# Builds a normalized term-frequency array of size 5000.
 # Uses np.add to count repeated indices
 def buildArray(listOfIndices):
-    returnVal = np.zeros(20000)
+    returnVal = np.zeros(VOCAB_SIZE)
     indicesArray = np.array(list(listOfIndices), dtype=np.int32)
     np.add.at(returnVal, indicesArray, 1)
     mysum = np.sum(returnVal)
@@ -62,12 +65,12 @@ allWords = keyAndListOfWords.flatMap(lambda x: [(w, 1) for w in x[1]])
 allCounts = allWords.reduceByKey(lambda a, b: a + b)
 
 # Pull top-20K words to driver as a Python list sorted descending by count
-topWords = allCounts.top(20000, key=lambda x: x[1])
+topWords = allCounts.top(VOCAB_SIZE, key=lambda x: x[1])
 
 print("Top Words in Corpus:", allCounts.top(10, key=lambda x: x[1]))
 
 # dictionary RDD: (word, rank_position) where position 0 = most frequent
-topWordsK = sc.parallelize(range(20000))
+topWordsK = sc.parallelize(range(VOCAB_SIZE))
 dictionary = topWordsK.map(lambda x : (topWords[x][0], x))
 
 print("Word Postions in our Feature Matrix. Last 20 words in 20k positions: ", dictionary.top(20, lambda x : x[1]))
@@ -78,86 +81,113 @@ print("Word Postions in our Feature Matrix. Last 20 words in 20k positions: ", d
 
 ################### TASK 2 ###################
 
-# (word, docID) for every word in every document
-allWordsWithDocID = keyAndListOfWords.flatMap(lambda x: ((j, x[0]) for j in x[1]))
 
-# join on word: (word, position) x (word, docID) -> (word, (position, docID))
-allDictionaryWords = dictionary.join(allWordsWithDocID)
 
-# drop the word key -> (docID, position)
-justDocAndPos = allDictionaryWords.map(lambda x: (x[1][1], x[1][0]))
+dictionaryMap = {topWords[i][0]: i for i in range(len(topWords))}
+dictionaryBC = sc.broadcast(dictionaryMap)
 
-# group positions by doc -> (docID, [pos1, pos2, ...])
-allDictionaryWordsInEachDoc = justDocAndPos.groupByKey()
 
-# build TF array per document
-allDocsAsNumpyArrays = allDictionaryWordsInEachDoc.map(lambda x: (x[0], buildArray(x[1])))
-print(allDocsAsNumpyArrays.take(3))
-
-# binary array - 1 if word appears in doc, 0 otherwise
-zeroOrOne = allDocsAsNumpyArrays.map(lambda x: (x[0], np.where(x[1] > 0, 1, 0)))
-
-# dfArray[i] = number of documents containing word i
-dfArray = zeroOrOne.reduce(lambda x1, x2: ("", np.add(x1[1], x2[1])))[1]
-
-# IDF(w) = log(corpus_size / document_frequency(w))
-idfArray = np.log(np.divide(np.full(20000, numberOfDocs), dfArray))
-
-# TF-IDF vector per document
-allDocsAsNumpyArraysTFidf = allDocsAsNumpyArrays.map(lambda x: (x[0], np.multiply(x[1], idfArray)))
-print(allDocsAsNumpyArraysTFidf.take(2))
-
-wikiCats.take(1)
-
-# Build featuresRDD: (category, tfidf_array) for each page in our corpus.
-#
-# PROBLEM with naive wikiCats.join(allDocsAsNumpyArraysTFidf):
-#   wikiCats covers all of Wikipedia — tens of millions of (pageID, category) rows
-#   Shuffling all of wikicats is hella work
-#
-# SOLUTION — broadcast-filter-then-join:
-#   1. collect only corpus docID strings to the driver as python set
-#   2. broadcast that to all executors
-#   3. filter wikiCats to only pages in our corpus
-#   4. join the filtered wikiCats with allDocsAsNumpyArraysTFidf.
-
-corpusDocIDs = set(allDocsAsNumpyArraysTFidf.map(lambda x: x[0]).collect())
-corpusDocIDsBroadcast = sc.broadcast(corpusDocIDs)
-
-# Map-side filter (no shuffle)
-wikiCatsFiltered = wikiCats.filter(lambda x: x[0] in corpusDocIDsBroadcast.value)
-
-# (pageID, category) join (pageID, tfidf_array) -> (category, tfidf_array)
-featuresRDD = wikiCatsFiltered.join(allDocsAsNumpyArraysTFidf).map(
-    lambda x: (x[1][0], x[1][1])
+justDocAndPos = keyAndListOfWords.flatMap(
+    lambda x: [(x[0], dictionaryBC.value[w]) for w in x[1] if w in dictionaryBC.value]
 )
 
-featuresRDD.cache()
-featuresRDD.take(10)
-print("featuresRDD count:", featuresRDD.count())
+
+docPosCounts = justDocAndPos.map(
+    lambda x: ((x[0], x[1]), 1)
+).reduceByKey(
+    lambda a, b: a + b
+)
+
+docWordCounts = docPosCounts.map(
+    lambda x: (x[0][0], (x[0][1], x[1]))
+)
+
+# Build normalized TF vectors
+def seqOp(arr, pc):
+    pos, cnt = pc
+    arr[pos] = cnt
+    return arr
 
 
-# kNN prediction: returns the top predicted categories for a text input
+allDocsAsNumpyArrays = (
+    docWordCounts.aggregateByKey(np.zeros(VOCAB_SIZE), seqOp, add)
+    .mapValues(lambda arr: arr / arr.sum() if arr.sum() > 0 else arr)
+)
+
+# print(allDocsAsNumpyArrays.take(3))
+
+# Compute document frequency directly from unique (docID, pos) pairs
+# Each ((docID, pos), count) means that word-position pos appears in that doc at least once
+dfCounts = docPosCounts.map(
+    lambda x: (x[0][1], 1)
+).reduceByKey(
+    lambda a, b: a + b
+).collect()
+
+dfArray = np.ones(VOCAB_SIZE)
+for pos, df in dfCounts:
+    dfArray[pos] = df
+
+# Inverse document frequency
+idfArray = np.log(np.divide(np.full(VOCAB_SIZE, numberOfDocs), dfArray))
+
+# TF-IDF vectors for pages
+pageTfidfRDD = allDocsAsNumpyArrays.map(
+    lambda x: (x[0], np.multiply(x[1], idfArray))
+).persist()
+
+print("tfidf docs:", pageTfidfRDD.count())
+
+# Keep only category rows whose pageID is in our corpus
+corpusDocIDs = set(pageTfidfRDD.map(lambda x: x[0]).collect())
+corpusDocIDsBroadcast = sc.broadcast(corpusDocIDs)
+
+wikiCatsFiltered = wikiCats.filter(
+    lambda x: x[0] in corpusDocIDsBroadcast.value
+).persist()
+
+print("wikiCatsFiltered count:", wikiCatsFiltered.count())
+
+
+# kNN prediction:
+# 1. compare query against page TF-IDF vectors
+# 2. take top-k pages
+# 3. vote using categories attached to those pages
 def getPrediction(textInput, k):
-    myDoc = sc.parallelize([textInput])
-    wordsInThatDoc = myDoc.flatMap(lambda x : ((j, 1) for j in regex.sub(' ', x).lower().split()))
+    words = regex.sub(' ', textInput).lower().split()
+    positions = [dictionaryBC.value[w] for w in words if w in dictionaryBC.value]
 
-    # join against dictionary, group all positions into one list keyed by 1
-    allDictionaryWordsInThatDoc = dictionary.join(wordsInThatDoc).map(lambda x: (x[1][1], x[1][0])).groupByKey()
+    myArray = np.zeros(VOCAB_SIZE)
+    if len(positions) > 0:
+        np.add.at(myArray, positions, 1)
+        mysum = np.sum(myArray)
+        if mysum > 0:
+            myArray = myArray / mysum
 
-    myArray = buildArray(allDictionaryWordsInThatDoc.top(1)[0][1])
     myArray = np.multiply(myArray, idfArray)
 
-    # cosine similarity between query and each (category, tfidf_array)
-    distances = featuresRDD.map(lambda x : (x[0], np.dot(x[1], myArray)))
-    topK = distances.top(k, lambda x : x[1])
+    # similarity to each page
+    distances = pageTfidfRDD.map(lambda x: (x[0], np.dot(x[1], myArray)))
 
-    # count vote over top-k categories
-    docIDRepresented = sc.parallelize(topK).map(lambda x : (x[0], 1))
-    numTimes = docIDRepresented.reduceByKey(lambda a, b: a + b)
-    return numTimes.top(k, lambda x: x[1])
+    # top-k nearest pages
+    topKPages = distances.top(k, key=lambda x: x[1])
+
+    # get page ids of top-k pages
+    topKPageIDs = set([x[0] for x in topKPages])
+    topKPageIDsBroadcast = sc.broadcast(topKPageIDs)
+
+    # vote over categories attached to those pages
+    numTimes = (
+        wikiCatsFiltered
+        .filter(lambda x: x[0] in topKPageIDsBroadcast.value)
+        .map(lambda x: (x[1], 1))
+        .reduceByKey(lambda a, b: a + b)
+    )
+
+    return numTimes.top(k, key=lambda x: x[1])
 
 
 print(getPrediction('Sport Basketball Volleyball Soccer', 10))
 print(getPrediction('What is the capital city of Australia?', 10))
-print(getPrediction('How many goals did Vancouver score last year?', 10))
+print(getPrediction('How many goals Vancouver score last year?', 10))
+
